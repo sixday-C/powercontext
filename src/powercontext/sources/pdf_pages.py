@@ -173,32 +173,81 @@ _STOP_WORDS = {
     "statements",
 }
 
+_FINANCIAL_QUERY_EXPANSIONS = (
+    (
+        {"geography", "geographies", "geographic", "region", "regions", "operates"},
+        ("operations segments", "geographic divisions"),
+    ),
+    ({"legal", "litigation", "lawsuits", "battles"}, ("legal proceedings", "legal matters")),
+    ({"restructuring", "reorganization"}, ("restructuring charges", "restructuring costs")),
+    ({"ebitda", "depreciation", "amortization"}, ("depreciation amortization", "operating income")),
+    ({"capex", "capital"}, ("capital expenditures", "capital spending")),
+    ({"cash", "flows"}, ("statement cash flows",)),
+    ({"income", "profit", "loss", "p&l"}, ("consolidated statement income",)),
+    ({"assets", "liabilities", "balance"}, ("consolidated balance sheets",)),
+)
 
-async def search_pdf_pages(memory, question: str, limit: int = 10) -> tuple[MemoryCitation, ...]:
-    """Fuse public scoped Memory searches and return their exact entry citations."""
-    if limit <= 0:
-        return ()
-    terms = [word for word in re.findall(r"[a-z]+|\d+", question.lower()) if len(word) > 2 and word not in _STOP_WORDS]
-    distinctive = list(dict.fromkeys(terms))
+
+def _search_queries(question: str) -> tuple[str, ...]:
+    tokens = re.findall(r"[a-z]+|\d+", question.lower())
+    distinctive = list(dict.fromkeys(word for word in tokens if len(word) > 2 and word not in _STOP_WORDS))
     queries = [question]
     if distinctive:
         queries.append(" ".join(distinctive[:12]))
-        if len(distinctive) > 5:
-            queries.append(" ".join(distinctive[-6:]))
+    if len(distinctive) > 4:
+        middle = len(distinctive) // 2
+        queries.extend((" ".join(distinctive[middle - 1 : middle + 1]), " ".join(distinctive[-2:])))
+    vocabulary = set(tokens)
+    for triggers, expansions in _FINANCIAL_QUERY_EXPANSIONS:
+        if vocabulary & triggers:
+            queries.extend(expansions)
+    return tuple(dict.fromkeys(queries[:10]))
+
+
+def _ranked_page_ids(channels: list[list[str]], scores: dict[str, float], limit: int) -> tuple[str, ...]:
+    selected: list[str] = []
+    seen: set[str] = set()
+
+    def add(identity: str) -> None:
+        if identity not in seen and len(selected) < limit:
+            seen.add(identity)
+            selected.append(identity)
+
+    for identity in channels[0][: max(1, limit * 2 // 5)]:
+        add(identity)
+    # Reserve space for specialized queries so a generic long question cannot
+    # crowd out pages using the document's terminology for the same concept.
+    for rank in range(max((len(channel) for channel in channels[1:]), default=0)):
+        for channel in channels[1:]:
+            if rank < len(channel):
+                add(channel[rank])
+    for identity in sorted(scores, key=lambda item: (-scores[item], item)):
+        add(identity)
+    return tuple(selected)
+
+
+async def search_pdf_pages(memory, question: str, limit: int = 10) -> tuple[MemoryCitation, ...]:
+    """Diversify public scoped Memory searches and return exact entry citations."""
+    if limit <= 0:
+        return ()
+    queries = _search_queries(question)
     scores: dict[str, float] = {}
     citations: dict[str, MemoryCitation] = {}
-    for query in dict.fromkeys(queries):
+    channels: list[list[str]] = []
+    for query in queries:
         page = await memory.search(SearchMemoryRequest(query=query, limit=max(20, limit), mode="fts"))
+        channel: list[str] = []
         for rank, hit in enumerate(page.hits, start=1):
             identity = hit.entry_id
             scores[identity] = scores.get(identity, 0.0) + 1.0 / (20 + rank)
+            channel.append(identity)
             citations[identity] = MemoryCitation(
                 memory_ref=hit.memory_ref,
                 entry_id=hit.entry_id,
                 entry_version_id=hit.entry_version_id,
             )
-    ordered = sorted(scores, key=lambda identity: (-scores[identity], identity))
-    return tuple(citations[identity] for identity in ordered[:limit])
+        channels.append(channel)
+    return tuple(citations[identity] for identity in _ranked_page_ids(channels, scores, limit))
 
 
 __all__ = [
