@@ -53,6 +53,28 @@ class SourceProcessingPendingProvider:
         self._binding = binding_name
         self._family = artifact_family
 
+    async def count_eligible_scopes(
+        self, connection: AsyncConnection, scope_ids: tuple[str, ...], threshold: int
+    ) -> frozenset[str]:
+        """Compare persisted journal positions with this family's successful cursors."""
+
+        if not scope_ids:
+            return frozenset()
+        heads = SOURCE_JOURNAL_HEADS_TABLE
+        positions = dict(
+            (
+                await connection.execute(
+                    select(heads.c.scope_id, heads.c.position).where(heads.c.scope_id.in_(scope_ids))
+                )
+            ).all()
+        )
+        cursors = await SourceCursorRepository().load_many(connection, scope_ids, self._binding)
+        return frozenset(
+            scope
+            for scope, position in positions.items()
+            if int(position) - (0 if scope not in cursors else cursors[scope].cursor.sequence) >= threshold
+        )
+
     async def reconcile(self, after_scope_id: str | None, limit: int, *, fence: ArtifactProcessingFence) -> str | None:
         heads = SOURCE_JOURNAL_HEADS_TABLE
         statement = select(heads.c.scope_id, heads.c.position).order_by(heads.c.scope_id).limit(limit)

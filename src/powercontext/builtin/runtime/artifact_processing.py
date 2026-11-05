@@ -80,6 +80,7 @@ _RETRY_STATE_LIMIT = 1000
 _CHANNEL_QUEUE_LIMIT = _DISCOVERY_PAGE_SIZE // 2
 _DISCOVERY_PAGE_DELAY_SECONDS = 0.01
 _DISCOVERY_TIMEOUT_SECONDS = 2.0
+_COUNT_POLL_SECONDS = 0.5
 _SPAWN_SIGTERM_GRACE_SECONDS = 1.0
 _WORKER_SHUTDOWN_TIMEOUT_SECONDS = 5.0
 ProcessingKey = tuple[str, str]
@@ -99,6 +100,10 @@ class ArtifactProcessingPendingProvider(Protocol):
         """Return the next keyset position, or None when this pass is complete."""
         ...
 
+    async def count_eligible_scopes(
+        self, connection: AsyncConnection, scope_ids: tuple[str, ...], threshold: int
+    ) -> frozenset[str]: ...
+
 
 @dataclass(frozen=True, slots=True)
 class ArtifactProcessingBinding:
@@ -110,6 +115,7 @@ class ArtifactProcessingBinding:
     max_workers: int = 1
     worker_timeout_seconds: float = 600.0
     automatic_processing_interval: timedelta | None = None
+    source_count_threshold: int | None = None
     cron: str | None = None
     timezone: str = "Asia/Shanghai"
     config_prefix: str | None = None
@@ -118,7 +124,7 @@ class ArtifactProcessingBinding:
     # their own Worker authorization and domain completion semantics.
     automatic_scope_filter: Callable[[AsyncConnection, tuple[str, ...]], Awaitable[frozenset[str]]] | None = None
 
-    def __post_init__(self) -> None:
+    def __post_init__(self) -> None:  # noqa: C901 - independent binding policy checks
         if not self.binding_name or self.binding_name != self.binding_name.strip():
             raise ValueError("binding_name must be nonempty and trimmed")  # noqa: TRY003
         if re.fullmatch(r"[a-z][a-z0-9-]*", self.artifact_family) is None:
@@ -131,6 +137,12 @@ class ArtifactProcessingBinding:
             raise ValueError("max_workers must be a positive integer")  # noqa: TRY003
         if self.worker_timeout_seconds <= 0:
             raise ValueError("worker_timeout_seconds must be positive")  # noqa: TRY003
+        if self.source_count_threshold is not None and (
+            type(self.source_count_threshold) is not int
+            or self.source_count_threshold < 1
+            or self.pending_provider is None
+        ):
+            raise ValueError("source_count_threshold requires a positive integer and a pending provider")  # noqa: TRY003
         if self.automatic_processing_interval is not None:
             if self.automatic_processing_interval.total_seconds() <= 0:
                 raise ValueError("automatic interval must be positive")  # noqa: TRY003
@@ -395,6 +407,7 @@ class _FamilyState:
     scan_after: int = 0
     scan_generation: int = 0
     scan_in_progress: bool = False
+    count_scan_only: bool = False
     reconcile_after: str | None = None
     reconcile_complete: bool = False
     notification_at_start: int = 0
@@ -709,32 +722,48 @@ class ArtifactProcessingSupervisor:
         scan_after = state.scan_after
         scan_generation = state.scan_generation
         scan_in_progress = False
+        count_scan_only = state.count_scan_only
         next_schedule_at = state.next_schedule_at
         next_discovery_at = state.next_discovery_at
         admitted: list[str] = []
         async with self._database.transaction() as connection:
             await self._leases.require_fence(connection, self._require_current_fence())
             persisted = await self._binding_states.load(connection, binding.binding_name, for_update=True)
-            enabled = binding.automatic_processing_interval is not None or binding.cron is not None
+            time_enabled = binding.automatic_processing_interval is not None or binding.cron is not None
+            enabled = time_enabled or binding.source_count_threshold is not None
             if not enabled:
                 if persisted is not None and persisted.scan_in_progress:
                     await self._binding_states.finish_scan(connection, binding.binding_name)
                 next_schedule_at = None
                 scan_after = 0
+                count_scan_only = False
             else:
                 now = await database_utc_now(connection)
                 if persisted is None or not persisted.scan_in_progress:
                     checkpoint = None if persisted is None else persisted.last_schedule_checkpoint_at
-                    due, next_time = _schedule_deadline(binding, checkpoint, now)
-                    next_schedule_at = asyncio.get_running_loop().time() + max(0, (next_time - now).total_seconds())
-                    if due is not None:
-                        persisted = await self._binding_states.start_scan(connection, binding.binding_name, due)
+                    due, next_time = _schedule_deadline(binding, checkpoint, now) if time_enabled else (None, None)
+                    count_due = (
+                        due is None
+                        and binding.source_count_threshold is not None
+                        and await self._count_due(connection, state)
+                    )
+                    if due is not None or count_due:
+                        count_scan_only = due is None
+                        persisted = await self._binding_states.start_scan(
+                            connection,
+                            binding.binding_name,
+                            due if due is not None else now,
+                            preserve_schedule_checkpoint=count_scan_only,
+                        )
                         scan_after = 0
+                    next_schedule_at = self._automatic_wake(binding, now, next_time)
                 if persisted is not None and persisted.scan_in_progress:
                     scan_in_progress = True
                     if scan_generation != persisted.scan_generation:
                         scan_generation = persisted.scan_generation
                         scan_after = 0
+                        if binding.source_count_threshold is not None and not time_enabled:
+                            count_scan_only = True
                     rows = await self._intents.scan(
                         connection,
                         binding.binding_name,
@@ -754,6 +783,10 @@ class ArtifactProcessingSupervisor:
                     eligible = frozenset(candidates)
                     if candidates and binding.automatic_scope_filter is not None:
                         eligible &= await binding.automatic_scope_filter(connection, candidates)
+                    if candidates and count_scan_only and binding.source_count_threshold is not None:
+                        eligible &= await binding.pending_provider.count_eligible_scopes(
+                            connection, candidates, binding.source_count_threshold
+                        )
                     for row in rows:
                         # A full page of ineligible rows still advances discovery;
                         # keep their dirty Source and request counters untouched.
@@ -770,17 +803,56 @@ class ArtifactProcessingSupervisor:
                         scan_after = 0
                         # Starting a scan established its checkpoint, so a
                         # completed page must not restart the interval here.
-                        _, next_time = _schedule_deadline(binding, persisted.last_schedule_checkpoint_at, now)
-                        next_schedule_at = asyncio.get_running_loop().time() + max(0, (next_time - now).total_seconds())
+                        _, next_time = (
+                            _schedule_deadline(binding, persisted.last_schedule_checkpoint_at, now)
+                            if time_enabled
+                            else (None, None)
+                        )
+                        next_schedule_at = self._automatic_wake(binding, now, next_time)
+                        count_scan_only = False
                     else:
                         next_discovery_at = asyncio.get_running_loop().time() + _DISCOVERY_PAGE_DELAY_SECONDS
         state.scan_after = scan_after
         state.scan_generation = scan_generation
         state.scan_in_progress = scan_in_progress
+        state.count_scan_only = count_scan_only
         state.next_schedule_at = next_schedule_at
         state.next_discovery_at = next_discovery_at
         for scope in admitted:
             self._enqueue(state, scope)
+
+    async def _count_due(self, connection: AsyncConnection, state: _FamilyState) -> bool:
+        binding = state.binding
+        threshold = binding.source_count_threshold
+        provider = binding.pending_provider
+        if threshold is None or provider is None:
+            return False
+        after = 0
+        while True:
+            rows = await self._intents.scan(
+                connection, binding.binding_name, after_sequence=after, limit=_DISCOVERY_PAGE_SIZE, dirty_only=True
+            )
+            candidates = tuple(
+                row.scope_id
+                for row in rows
+                if row.scope_id not in state.queued
+                and row.scope_id not in state.running
+                and row.scope_id not in state.retries
+            )
+            if await provider.count_eligible_scopes(connection, candidates, threshold):
+                return True
+            if len(rows) < _DISCOVERY_PAGE_SIZE:
+                return False
+            after = rows[-1].pending_sequence
+
+    @staticmethod
+    def _automatic_wake(binding: ArtifactProcessingBinding, now: datetime, next_time: datetime | None) -> float | None:
+        delays = []
+        if next_time is not None:
+            delays.append(max(0, (next_time - now).total_seconds()))
+        if binding.source_count_threshold is not None:
+            delays.append(_COUNT_POLL_SECONDS)
+        return None if not delays else asyncio.get_running_loop().time() + min(delays)
 
     @staticmethod
     def _fresh_capacity(state: _FamilyState) -> int:
@@ -1059,6 +1131,7 @@ class ArtifactProcessingSupervisor:
             state.retries.clear()
             state.requested_after = state.scan_after = state.scan_generation = 0
             state.scan_in_progress = False
+            state.count_scan_only = False
             state.discovery_pending = True
 
     async def _reap_unconfirmed_exits(self) -> None:
@@ -1147,7 +1220,7 @@ def _schedule_deadline(
     trigger = CronTrigger.from_crontab(binding.cron, timezone=ZoneInfo(binding.timezone))
     first = trigger.get_next_fire_time(None, (checkpoint + timedelta(microseconds=1)).replace(tzinfo=UTC))
     if first is None:
-        return None, datetime.max.replace(tzinfo=None)
+        return None, datetime.max.replace(tzinfo=None)  # noqa: DTZ901 - database UTC timestamps are naive
     first = first.astimezone(UTC).replace(tzinfo=None)
     if first > now:
         return None, first
@@ -1164,7 +1237,7 @@ def _schedule_deadline(
         else:
             hi = mid
     following = trigger.get_next_fire_time(None, (latest + timedelta(microseconds=1)).replace(tzinfo=UTC))
-    return latest, datetime.max.replace(tzinfo=None) if following is None else following.astimezone(UTC).replace(
+    return latest, datetime.max.replace(tzinfo=None) if following is None else following.astimezone(UTC).replace(  # noqa: DTZ901 - database UTC timestamps are naive
         tzinfo=None
     )
 
