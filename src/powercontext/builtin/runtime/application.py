@@ -299,6 +299,7 @@ if TYPE_CHECKING:
 
     from powercontext.builtin.handoff_report.application import HandoffReportApplication
     from powercontext.builtin.runtime.artifact_processing import ArtifactProcessingSupervisors
+    from powercontext.builtin.runtime.context_pack import ContextPack, ContextPackDelta
 
 
 class TopicMemorySearch(Protocol):
@@ -827,6 +828,18 @@ class ScopedContextApplication:
     def __init__(self, runtime: BuiltinRuntime, scope_id: str) -> None:
         self._runtime = runtime
         self.scope_id = validate_scope_id(scope_id)
+
+    async def prepare_incremental(
+        self, request: PrepareContextRequest, base_pack: ContextPack | None = None
+    ) -> ContextPack | ContextPackDelta:
+        """Prepare the same text as ``prepare`` and encode a full or delta packet."""
+        from powercontext.builtin.runtime.context_pack import ContextPack, ContextPackDelta
+
+        prepared = await self.prepare(request)
+        target = ContextPack.from_content(prepared.content or "")
+        if base_pack is None:
+            return target
+        return ContextPackDelta.between(base_pack, target)
 
     async def prepare(
         self,
