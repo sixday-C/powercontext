@@ -17,6 +17,9 @@
 from __future__ import annotations
 
 import json
+import math
+import re
+from collections import Counter
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from itertools import chain
@@ -46,6 +49,38 @@ _MIN_TRUNCATED_CONTENT_BYTES = 64
 _ELLIPSIS = "…"
 _BEGIN_MARKER = "BEGIN_POWERCONTEXT_PREPARED_CONTEXT_V1"
 _END_MARKER = "END_POWERCONTEXT_PREPARED_CONTEXT_V1"
+_EVIDENCE_WORDS = re.compile(r"[a-z]+|\d+", re.IGNORECASE)
+_EVIDENCE_SENTENCES = re.compile(r"[^.!?\n]+(?:[.!?]+|$)")
+_EVIDENCE_STOPWORDS = frozenset([
+    "a",
+    "an",
+    "and",
+    "are",
+    "as",
+    "at",
+    "be",
+    "by",
+    "can",
+    "for",
+    "from",
+    "has",
+    "have",
+    "in",
+    "is",
+    "it",
+    "of",
+    "on",
+    "or",
+    "that",
+    "the",
+    "their",
+    "these",
+    "this",
+    "to",
+    "was",
+    "were",
+    "with",
+])
 _Item = TypeVar("_Item")
 
 
@@ -106,6 +141,7 @@ class PreparedContextBuild:
     origins: tuple[PreparedContextOrigin, ...]
     omissions: PreparedContextOmissions = PreparedContextOmissions()
     code_origins: tuple[CodeEvidenceRef, ...] = ()
+    fragments: tuple[PreparedContextFragment, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -115,6 +151,25 @@ class MemoryEntryAddress:
     memory: ArtifactAddress
     entry_id: str
     entry_version_id: str
+
+
+@dataclass(frozen=True)
+class PreparedContextFragment:
+    """One literal span from an exact Memory entry version."""
+
+    address: MemoryEntryAddress
+    start: int
+    end: int
+    text: str
+
+
+@dataclass(frozen=True)
+class _EvidenceSpan:
+    address: MemoryEntryAddress
+    start: int
+    end: int
+    text: str
+    rank: int
 
 
 PreparedContextOrigin = MemoryCitation | ArtifactRef | MemoryEntryAddress | ArtifactAddress
@@ -211,6 +266,10 @@ class PreparedContextBuilder:
         profile_candidates: Sequence[PreparedProfileCandidate] = (),
         code_candidates: Sequence[PreparedCodeCandidate] = (),
     ) -> PreparedContextBuild:
+        if request.evidence_selection:
+            if sum(len(candidates.hits) for candidates in memory_candidates) > self.memory_candidate_limit:
+                raise PreparedContextInvariantError("memory-candidate-limit")
+            return self._select_evidence(request, memory_candidates)
         if request.include_code:
 
             def historical(history_request: PrepareContextRequest, entries: int) -> PreparedContextBuild:
@@ -256,6 +315,72 @@ class PreparedContextBuilder:
             omissions=omissions,
         )
 
+    def _select_evidence(  # noqa: C901 - validate, rank, and fit literal evidence
+        self, request: PrepareContextRequest, memory_candidates: Sequence[PreparedMemoryCandidates]
+    ) -> PreparedContextBuild:
+        """Fit query-ranked literal sentences, including their exact citations."""
+
+        query_terms = Counter(_evidence_terms(request.query))
+        candidates: list[_EvidenceSpan] = []
+        seen: set[tuple[str, str, int, str, str]] = set()
+        rank = 0
+        for group in memory_candidates:
+            if group.hits and group.memory_ref is None:
+                raise PreparedContextInvariantError("memory-ref-missing")
+            for hit in group.hits:
+                if hit.memory_ref != group.memory_ref:
+                    raise PreparedContextInvariantError("memory-ref-mismatch")
+                identity = (
+                    group.scope_id,
+                    hit.memory_ref.artifact_id,
+                    hit.memory_ref.revision,
+                    hit.entry_id,
+                    hit.entry_version_id,
+                )
+                if identity in seen:
+                    continue
+                seen.add(identity)
+                address = MemoryEntryAddress(
+                    memory=ArtifactAddress(scope_id=group.scope_id, artifact=hit.memory_ref),
+                    entry_id=hit.entry_id,
+                    entry_version_id=hit.entry_version_id,
+                )
+                for start, end in _sentence_spans(hit.text):
+                    candidates.append(_EvidenceSpan(address, start, end, hit.text[start:end], rank))
+                rank += 1
+        if not candidates:
+            return PreparedContextBuild(context=self.empty(), origins=())
+
+        document_frequency = Counter(
+            term for span in candidates for term in set(_evidence_terms(span.text)) if term in query_terms
+        )
+        ranked = sorted(
+            candidates,
+            key=lambda span: (
+                -_evidence_score(span, query_terms, document_frequency, len(candidates)),
+                span.rank,
+                span.start,
+            ),
+        )
+        selected: list[PreparedContextFragment] = []
+        content: str | None = None
+        for span in ranked:
+            if len(selected) >= self.entry_limit:
+                break
+            fragment = PreparedContextFragment(span.address, span.start, span.end, span.text)
+            proposed = (*selected, fragment)
+            rendered = _render_evidence(proposed)
+            if len(rendered.encode("utf-8")) <= request.max_bytes:
+                selected.append(fragment)
+                content = rendered
+        if content is None:
+            return PreparedContextBuild(context=self.empty(), origins=())
+        return PreparedContextBuild(
+            context=PreparedContext(status="ready", content=content, content_bytes=len(content.encode("utf-8"))),
+            origins=tuple(fragment.address for fragment in selected),
+            fragments=tuple(selected),
+        )
+
     def probe_budget(
         self,
         *,
@@ -274,8 +399,18 @@ class PreparedContextBuilder:
 
         Pure and side-effect free: no I/O, no persistence, nothing reported to any sink, and
         the same inputs as :meth:`build_scopes_result` are guaranteed to yield the same
-        counters because both go through :meth:`_select_entries`.
+        counters because both use the corresponding selection path.
         """
+
+        if request.evidence_selection:
+            build = self._select_evidence(request, memory_candidates)
+            return RecallBudgetView(
+                max_bytes=request.max_bytes,
+                delivered_items=len(build.fragments),
+                truncated_items=0,
+                dropped_items=0,
+                unused_bytes=request.max_bytes - build.context.content_bytes,
+            )
 
         content, origins, omissions = self._select_entries(
             request=request,
@@ -691,6 +826,53 @@ def _render(entries: Sequence[_PreparedContextEntry]) -> str:
         "items": [_render_entry(entry) for entry in entries],
     }
     encoded = json.dumps(envelope, ensure_ascii=False, separators=(",", ":"))
+    return "\n\n".join((TRUST_POLICY, f"{_BEGIN_MARKER}\n{encoded}\n{_END_MARKER}"))
+
+
+def _evidence_terms(text: str) -> tuple[str, ...]:
+    words = tuple(match.group().lower() for match in _EVIDENCE_WORDS.finditer(text))
+    informative = tuple(word for word in words if word not in _EVIDENCE_STOPWORDS)
+    return informative or words
+
+
+def _sentence_spans(text: str) -> tuple[tuple[int, int], ...]:
+    spans = []
+    for match in _EVIDENCE_SENTENCES.finditer(text):
+        start, end = match.span()
+        while start < end and text[start].isspace():
+            start += 1
+        while end > start and text[end - 1].isspace():
+            end -= 1
+        if start < end:
+            spans.append((start, end))
+    return tuple(spans)
+
+
+def _evidence_score(span: _EvidenceSpan, query: Counter[str], document_frequency: Counter[str], total: int) -> float:
+    words = Counter(_evidence_terms(span.text))
+    overlap = sum(
+        min(count, words[term]) * (1.0 + math.log((total + 1) / (document_frequency[term] + 1)))
+        for term, count in query.items()
+    )
+    return overlap + 0.05 * len(query.keys() & words.keys()) - 0.0002 * len(span.text)
+
+
+def _render_evidence(fragments: Sequence[PreparedContextFragment]) -> str:
+    items = [
+        {
+            "citation": {
+                "scope_id": fragment.address.memory.scope_id,
+                "memory_ref": fragment.address.memory.artifact.model_dump(mode="json"),
+                "entry_id": fragment.address.entry_id,
+                "entry_version_id": fragment.address.entry_version_id,
+            },
+            "content": fragment.text,
+            "start": fragment.start,
+            "end": fragment.end,
+        }
+        for fragment in fragments
+    ]
+    encoded = json.dumps({"trust": "untrusted_history", "items": items}, ensure_ascii=False, separators=(",", ":"))
     return "\n\n".join((TRUST_POLICY, f"{_BEGIN_MARKER}\n{encoded}\n{_END_MARKER}"))
 
 
