@@ -2681,6 +2681,17 @@ class ScopedTopicMemoryApplication:
                     embedding_timeout_seconds,
                 )
         observer = self._runtime._topic_memory_search_observer
+        inactive_topics = await self._runtime.lifecycle.for_scope(self.scope_id).inactive_topics()
+        if inactive_topics:
+            result = result.model_copy(
+                update={
+                    "hits": tuple(
+                        hit
+                        for hit in result.hits
+                        if (hit.artifact_ref.artifact_id, hit.artifact_ref.revision) not in inactive_topics
+                    )
+                }
+            )
         if observer is not None:
             try:
                 observer(result.mode, used_fallback)
@@ -3123,6 +3134,9 @@ class BuiltinRuntime:
         self.work = WorkApplication(self)
         self.memory = MemoryApplication(self)
         self.topic_memory = TopicMemoryApplication(self)
+        from powercontext.builtin.runtime.source_lifecycle import SourceLifecycleApplication
+
+        self.lifecycle = SourceLifecycleApplication(self)
         self.records = RecordApplication(self)
         self.prompts = PromptApplication(self)
         self.review = ReviewApplication(self)
