@@ -211,6 +211,16 @@ _FINANCIAL_QUERY_EXPANSIONS = (
     ({"customer", "customers", "concentration"}, ("one customer accounted", "major customers")),
     ({"segments", "categories"}, ("summary of business segment data",)),
     ({"card", "members", "retention"}, ("card member retention", "card member", "net card fees")),
+    (
+        {"capital", "intensive", "intensity"},
+        ("consolidated statement of income", "consolidated balance sheet", "consolidated statement of cash flows"),
+    ),
+    (
+        {"revenue", "sales", "growth", "cogs", "payable", "dpo"},
+        ("consolidated statements of operations", "consolidated statement of income"),
+    ),
+    ({"payable", "dpo"}, ("cost of sales", "consolidated balance sheets")),
+    ({"organic", "divestitures"}, ("organic sales", "sales change by business segment")),
 )
 
 
@@ -224,6 +234,8 @@ def _search_queries(question: str) -> tuple[str, ...]:
     for triggers, expansions in _FINANCIAL_QUERY_EXPANSIONS:
         if vocabulary & triggers:
             queries.extend(expansions)
+    if {"segment", "segments"} & vocabulary and {"growth", "change", "sales"} & vocabulary:
+        queries.extend(("organic sales", "sales change by business segment"))
     if len(queries) == 2 and len(distinctive) > 4:
         queries.extend((" ".join(distinctive[:2]), " ".join(distinctive[-2:])))
     return tuple(dict.fromkeys(queries[:8]))
@@ -256,11 +268,9 @@ def _page_priority(
 
 def _heading_match(text: str, query: str) -> bool:
     """Prefer a statement's own page over notes that only cite its title."""
-    lines = text.splitlines()[1:]
-    heading_line = next((line for line in lines if line.strip() and line.strip().lower() != "table of contents"), "")
-    heading = " ".join(re.findall(r"[a-z]+|\d+", heading_line.lower()))
     phrase = " ".join(re.findall(r"[a-z]+|\d+", query.lower()))
-    return bool(phrase and phrase in heading)
+    opening = " ".join(re.findall(r"[a-z]+|\d+", " ".join(text.splitlines()[1:6]).lower()))
+    return bool(phrase and phrase in opening)
 
 
 async def search_pdf_pages(memory, question: str, limit: int = 10) -> tuple[MemoryCitation, ...]:
