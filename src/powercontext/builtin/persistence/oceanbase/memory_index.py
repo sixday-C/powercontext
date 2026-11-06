@@ -107,12 +107,16 @@ def _hybrid_search_sql(*, tagged: bool) -> str:
     vector_tags = memory_tag_sql("m") if tagged else ""
     return f"""
 SELECT 'fts' AS channel, f.memory_artifact_id, f.head_revision,
-       f.entry_id, f.entry_version_id, v.text,
+       f.entry_id, f.entry_version_id, f.text,
        NULL AS distance, f.sort_value
 FROM (
     SELECT f.memory_artifact_id, f.head_revision, f.entry_id, f.entry_version_id,
-           -MATCH(f.searchable_text) AGAINST (:analyzed_query) AS sort_value
+           v.text, -MATCH(f.searchable_text) AGAINST (:analyzed_query) AS sort_value
     FROM pc_memory_entry_heads AS f
+    JOIN pc_memory_entry_versions AS v
+      ON v.scope_id = f.scope_id
+     AND v.memory_artifact_id = f.memory_artifact_id
+     AND v.entry_version_id = f.entry_version_id
     WHERE f.scope_id = :scope_id
       AND f.memory_artifact_id IN :memory_artifact_ids
       AND MATCH(f.searchable_text) AGAINST (:analyzed_query)
@@ -121,29 +125,25 @@ FROM (
              f.memory_artifact_id, f.entry_id, f.entry_version_id
     LIMIT :candidate_limit
 ) AS f
-JOIN pc_memory_entry_versions AS v
-  ON v.scope_id = :scope_id
- AND v.memory_artifact_id = f.memory_artifact_id
- AND v.entry_version_id = f.entry_version_id
 UNION ALL
 SELECT 'vector' AS channel, m.memory_artifact_id, m.head_revision,
-       m.entry_id, m.entry_version_id, v.text,
+       m.entry_id, m.entry_version_id, m.text,
        m.distance, m.distance AS sort_value
 FROM (
     SELECT m.scope_id, m.memory_artifact_id, m.head_revision,
-           m.entry_id, m.entry_version_id,
+           m.entry_id, m.entry_version_id, v.text,
            l2_distance(m.embedding, :query_vector) AS distance
     FROM pc_memory_vector_entries AS m
+    JOIN pc_memory_entry_versions AS v
+      ON v.scope_id = m.scope_id
+     AND v.memory_artifact_id = m.memory_artifact_id
+     AND v.entry_version_id = m.entry_version_id
     WHERE m.scope_id = :scope_id
       AND m.memory_artifact_id IN :memory_artifact_ids
       {vector_tags}
     ORDER BY l2_distance(m.embedding, :query_vector) APPROXIMATE
     LIMIT :candidate_limit
 ) AS m
-JOIN pc_memory_entry_versions AS v
-  ON v.scope_id = m.scope_id
- AND v.memory_artifact_id = m.memory_artifact_id
- AND v.entry_version_id = m.entry_version_id
 ORDER BY channel, sort_value, memory_artifact_id, entry_id, entry_version_id
 """
 
