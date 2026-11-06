@@ -8,6 +8,7 @@ import hashlib
 import io
 import json
 import re
+from collections.abc import Iterator
 
 from pydantic import BaseModel, model_validator
 from pypdf import PdfReader
@@ -171,6 +172,18 @@ _STOP_WORDS = {
     "company",
     "statement",
     "statements",
+    "reasonably",
+    "healthy",
+    "profile",
+    "based",
+    "please",
+    "state",
+    "explain",
+    "why",
+    "useful",
+    "metric",
+    "like",
+    "major",
 }
 
 _FINANCIAL_QUERY_EXPANSIONS = (
@@ -183,8 +196,21 @@ _FINANCIAL_QUERY_EXPANSIONS = (
     ({"ebitda", "depreciation", "amortization"}, ("depreciation amortization", "operating income")),
     ({"capex", "capital"}, ("capital expenditures", "capital spending")),
     ({"cash", "flows"}, ("statement cash flows",)),
-    ({"income", "profit", "loss", "p&l"}, ("consolidated statement income",)),
+    ({"income", "profit", "loss", "p&l"}, ("consolidated statement of income",)),
     ({"assets", "liabilities", "balance"}, ("consolidated balance sheets",)),
+    (
+        {"quick", "liquidity", "liability", "liabilities"},
+        ("current assets current liabilities", "consolidated balance sheets"),
+    ),
+    (
+        {"margin", "operating", "gross"},
+        ("operating income", "consolidated statements of operations", "consolidated statements of income"),
+    ),
+    ({"tax", "taxes"}, ("effective tax rate", "income taxes")),
+    ({"products", "services", "sells"}, ("overview", "products and services")),
+    ({"customer", "customers", "concentration"}, ("one customer accounted", "major customers")),
+    ({"segments", "categories"}, ("summary of business segment data",)),
+    ({"card", "members", "retention"}, ("card member retention", "card member", "net card fees")),
 )
 
 
@@ -194,36 +220,47 @@ def _search_queries(question: str) -> tuple[str, ...]:
     queries = [question]
     if distinctive:
         queries.append(" ".join(distinctive[:12]))
-    if len(distinctive) > 4:
-        middle = len(distinctive) // 2
-        queries.extend((" ".join(distinctive[middle - 1 : middle + 1]), " ".join(distinctive[-2:])))
     vocabulary = set(tokens)
     for triggers, expansions in _FINANCIAL_QUERY_EXPANSIONS:
         if vocabulary & triggers:
             queries.extend(expansions)
-    return tuple(dict.fromkeys(queries[:10]))
+    if len(queries) == 2 and len(distinctive) > 4:
+        queries.extend((" ".join(distinctive[:2]), " ".join(distinctive[-2:])))
+    return tuple(dict.fromkeys(queries[:8]))
 
 
-def _ranked_page_ids(channels: list[list[str]], scores: dict[str, float], limit: int) -> tuple[str, ...]:
-    selected: list[str] = []
-    seen: set[str] = set()
+def _ranked_page_ids(
+    channels: list[list[str]], scores: dict[str, float], heading_ids: list[str], limit: int
+) -> tuple[str, ...]:
+    return tuple(dict.fromkeys(_page_priority(channels, scores, heading_ids, limit)))[:limit]
 
-    def add(identity: str) -> None:
-        if identity not in seen and len(selected) < limit:
-            seen.add(identity)
-            selected.append(identity)
 
-    for identity in channels[0][: max(1, limit * 2 // 5)]:
-        add(identity)
-    # Reserve space for specialized queries so a generic long question cannot
-    # crowd out pages using the document's terminology for the same concept.
+def _page_priority(
+    channels: list[list[str]], scores: dict[str, float], heading_ids: list[str], limit: int
+) -> Iterator[str]:
+    yield from channels[0][: max(1, limit // 5)]
+    yield from heading_ids
+    # The first financial expansion is the most specific alternate phrasing.
+    # Keep enough of its results to reach tables which BM25 ranks below notes.
+    if len(channels) > 2:
+        yield from channels[2][: max(1, limit // 2)]
+        for channel in channels[3:]:
+            yield from channel[:2]
+    if len(channels) > 1:
+        yield from channels[1][:2]
     for rank in range(max((len(channel) for channel in channels[1:]), default=0)):
         for channel in channels[1:]:
-            if rank < len(channel):
-                add(channel[rank])
-    for identity in sorted(scores, key=lambda item: (-scores[item], item)):
-        add(identity)
-    return tuple(selected)
+            yield from channel[rank : rank + 1]
+    yield from sorted(scores, key=lambda item: (-scores[item], item))
+
+
+def _heading_match(text: str, query: str) -> bool:
+    """Prefer a statement's own page over notes that only cite its title."""
+    lines = text.splitlines()[1:]
+    heading_line = next((line for line in lines if line.strip() and line.strip().lower() != "table of contents"), "")
+    heading = " ".join(re.findall(r"[a-z]+|\d+", heading_line.lower()))
+    phrase = " ".join(re.findall(r"[a-z]+|\d+", query.lower()))
+    return bool(phrase and phrase in heading)
 
 
 async def search_pdf_pages(memory, question: str, limit: int = 10) -> tuple[MemoryCitation, ...]:
@@ -234,20 +271,26 @@ async def search_pdf_pages(memory, question: str, limit: int = 10) -> tuple[Memo
     scores: dict[str, float] = {}
     citations: dict[str, MemoryCitation] = {}
     channels: list[list[str]] = []
-    for query in queries:
-        page = await memory.search(SearchMemoryRequest(query=query, limit=max(20, limit), mode="fts"))
+    heading_ids: list[str] = []
+    for query_index, query in enumerate(queries):
+        page = await memory.search(SearchMemoryRequest(query=query, limit=max(80, limit * 4), mode="fts"))
         channel: list[str] = []
+        headings: dict[str, bool] = {}
         for rank, hit in enumerate(page.hits, start=1):
             identity = hit.entry_id
             scores[identity] = scores.get(identity, 0.0) + 1.0 / (20 + rank)
             channel.append(identity)
+            headings[identity] = _heading_match(hit.text, query)
             citations[identity] = MemoryCitation(
                 memory_ref=hit.memory_ref,
                 entry_id=hit.entry_id,
                 entry_version_id=hit.entry_version_id,
             )
+        if query_index >= 2:
+            channel.sort(key=lambda identity: not headings[identity])
+            heading_ids.extend(identity for identity in channel[:1] if headings[identity])
         channels.append(channel)
-    return tuple(citations[identity] for identity in _ranked_page_ids(channels, scores, limit))
+    return tuple(citations[identity] for identity in _ranked_page_ids(channels, scores, heading_ids, limit))
 
 
 __all__ = [
